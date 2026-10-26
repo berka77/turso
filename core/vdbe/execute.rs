@@ -55,7 +55,7 @@ use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
     decode_serial_type_into_register, registers_to_ref_values, DeferredSeekState, EndStatement,
-    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState,
+    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState, WriteBaseline,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -5333,6 +5333,16 @@ pub fn op_transaction_inner(
                             "write statement started with view changes left by an earlier statement"
                         );
                         state.is_active_write = true;
+                        if is_main_db {
+                            state.write_baseline = match mv_store.as_ref() {
+                                Some(mv_store) => program
+                                    .connection
+                                    .get_mv_tx_id()
+                                    .and_then(|tx_id| mv_store.tx_write_set_len(tx_id))
+                                    .map_or(WriteBaseline::None, WriteBaseline::MvccWriteSet),
+                                None => WriteBaseline::PagerDirties(pager.pages_dirtied_count()),
+                            };
+                        }
                     }
                     if is_main_db && in_explicit_txn && state.has_stmt_transaction {
                         state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;
