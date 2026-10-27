@@ -51,12 +51,13 @@ expect {
     20
 }
 
-test collate_locale_en_numeric_upper_level2_case_order {
+# Upper case first is a tertiary difference, so it needs the default (tertiary) strength.
+test collate_locale_en_numeric_upper_case_order {
     WITH values_to_sort(value) AS (
         VALUES ('z'), ('a'), ('Z'), ('A')
     )
     SELECT value FROM values_to_sort
-    ORDER BY value COLLATE 'en-u-kn-true-kf-upper-ks-level2';
+    ORDER BY value COLLATE 'en-u-kn-true-kf-upper';
 }
 expect {
     A
@@ -65,12 +66,14 @@ expect {
     z
 }
 
-test collate_locale_en_numeric_upper_level2_o_variants_distinct {
+# Secondary strength ignores case but not accents.
+
+test collate_locale_en_numeric_upper_level2_case_equal_accents_distinct {
     SELECT
         'O' = 'o' COLLATE 'en-u-kn-true-kf-upper-ks-level2',
         'o' = char(242) COLLATE 'en-u-kn-true-kf-upper-ks-level2',
         'O' = char(242) COLLATE 'en-u-kn-true-kf-upper-ks-level2';
 }
 expect {
-    0|0|0
+    1|0|0
 }
