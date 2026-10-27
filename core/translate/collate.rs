@@ -5,8 +5,11 @@ use std::{
     str::FromStr as _,
 };
 
-use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
-use icu_locale::Locale;
+use icu_collator::{
+    options::{CollatorOptions, Strength},
+    Collator, CollatorBorrowed,
+};
+use icu_locale::{extensions::unicode::key, Locale};
 use turso_parser::ast::Expr;
 
 use crate::{
@@ -248,6 +251,22 @@ impl LocaleCollationId {
     }
 }
 
+/// The comparison strength requested in the locale tag with the Unicode extension key `ks`
+/// (BCP 47, CLDR): `sv-u-ks-level2` compares Swedish text ignoring case, `level1` also ignores
+/// accents. Without the key, or with a value CLDR does not define, the collator's default
+/// (tertiary) applies.
+fn strength_from_locale(locale: &Locale) -> Option<Strength> {
+    let value = locale.extensions.unicode.keywords.get(&key!("ks"))?;
+    match value.to_string().as_str() {
+        "level1" => Some(Strength::Primary),
+        "level2" => Some(Strength::Secondary),
+        "level3" => Some(Strength::Tertiary),
+        "level4" => Some(Strength::Quaternary),
+        "identic" => Some(Strength::Identical),
+        _ => None,
+    }
+}
+
 struct LocaleCollation {
     name: String,
     collator: CollatorBorrowed<'static>,
@@ -274,10 +293,11 @@ impl LocaleCollationRegistry {
         let locale = Locale::from_str(name).map_err(|_| {
             crate::LimboError::ParseError(format!("no such collation sequence: {name}"))
         })?;
-        let collator =
-            Collator::try_new(locale.into(), CollatorOptions::default()).map_err(|_| {
-                crate::LimboError::ParseError(format!("no such collation sequence: {name}"))
-            })?;
+        let mut options = CollatorOptions::default();
+        options.strength = strength_from_locale(&locale);
+        let collator = Collator::try_new(locale.into(), options).map_err(|_| {
+            crate::LimboError::ParseError(format!("no such collation sequence: {name}"))
+        })?;
 
         let mut collations = self.collations.write();
         if let Some((idx, _)) = collations
@@ -600,6 +620,33 @@ fn get_collseq_parts_from_expr_with_symbols(
     })?;
 
     Ok((maybe_explicit_collseq, maybe_column_collseq))
+}
+
+#[cfg(test)]
+mod locale_strength_tests {
+    use super::*;
+
+    fn cmp(collation: &str, lhs: &str, rhs: &str) -> Ordering {
+        CollationSeq::new(collation)
+            .unwrap()
+            .compare_strings(lhs, rhs)
+    }
+
+    #[test]
+    fn locale_tag_strength_is_applied() {
+        // Default (tertiary): case matters.
+        assert_ne!(cmp("sv", "Åsa", "åsa"), Ordering::Equal);
+        // level2: case is ignored, accents are not.
+        assert_eq!(cmp("sv-u-ks-level2", "Åsa", "åsa"), Ordering::Equal);
+        assert_ne!(cmp("sv-u-ks-level2", "José", "Jose"), Ordering::Equal);
+        // level1: case and accents are ignored, but Swedish å, ä and ö stay letters of their own.
+        assert_eq!(cmp("sv-u-ks-level1", "José", "jose"), Ordering::Equal);
+        assert_ne!(cmp("sv-u-ks-level1", "å", "a"), Ordering::Equal);
+        // Swedish order at every strength: å, ä, ö after z.
+        assert_eq!(cmp("sv-u-ks-level1", "Östen", "zeta"), Ordering::Greater);
+        // A value CLDR does not define falls back to the default.
+        assert_ne!(cmp("sv-u-ks-bogus", "Åsa", "åsa"), Ordering::Equal);
+    }
 }
 
 #[cfg(test)]
