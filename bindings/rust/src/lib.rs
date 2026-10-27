@@ -38,6 +38,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod batch;
 pub mod connection;
+mod functions;
 pub mod params;
 mod rows;
 pub mod transaction;

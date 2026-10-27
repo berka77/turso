@@ -135,7 +135,9 @@ impl Connection {
     }
 
     /// get the inner connection
-    fn get_inner_connection(&self) -> Result<Arc<turso_sdk_kit::rsapi::TursoConnection>> {
+    pub(crate) fn get_inner_connection(
+        &self,
+    ) -> Result<Arc<turso_sdk_kit::rsapi::TursoConnection>> {
         match &self.inner {
             Some(inner) => Ok(inner.clone()),
             None => Err(Error::Misuse("inner connection must be set".to_string())),

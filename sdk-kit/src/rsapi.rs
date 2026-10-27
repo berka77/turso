@@ -68,7 +68,7 @@ impl Drop for SyncBusyGuard {
 pub use turso_core::types::FromValue;
 pub use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
-    StepFunction, Value as ExtensionValue, ValueDestructor,
+    StepFunction, Value as ExtensionValue, ValueDestructor, ValueType as ExtensionValueType,
 };
 pub type EncryptionOpts = turso_core::EncryptionOpts;
 pub type Value = turso_core::Value;
