@@ -525,15 +525,14 @@ impl<'a> Resolver<'a> {
         func_name: &str,
         arg_count: usize,
     ) -> Result<Option<Func>, LimboError> {
-        // The dialect owns the function name surface of user SQL; extension
-        // functions resolve after it.
-        match self.dialect.resolve_function(func_name, arg_count)? {
-            Some(func) => Ok(Some(func)),
-            None => Ok(self
-                .symbol_table
-                .resolve_function(func_name, arg_count)
-                .map(Func::External)),
+        // A function the application registered on this connection overrides a
+        // built-in one with the same name and number of arguments, as with SQLite's
+        // sqlite3_create_function (this is how SQLite's ICU extension replaces
+        // like(), upper() and lower()). Everything else resolves through the dialect.
+        if let Some(external) = self.symbol_table.resolve_function(func_name, arg_count) {
+            return Ok(Some(Func::External(external)));
         }
+        self.dialect.resolve_function(func_name, arg_count)
     }
 
     pub(crate) fn enable_expr_to_reg_cache(&mut self) {

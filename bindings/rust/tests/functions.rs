@@ -104,3 +104,62 @@ async fn application_scalar_function_gets_arguments_and_returns_values_and_error
     };
     assert!(panicked.contains("panicked"), "{panicked}");
 }
+
+/// SQL LIKE matching (`%`, `_`) on already case-folded text, for the test's own like().
+fn like_match(pattern: &[char], text: &[char]) -> bool {
+    match pattern.split_first() {
+        None => text.is_empty(),
+        Some(('%', rest)) => (0..=text.len()).any(|i| like_match(rest, &text[i..])),
+        Some(('_', rest)) => !text.is_empty() && like_match(rest, &text[1..]),
+        Some((c, rest)) => text.first() == Some(c) && like_match(rest, &text[1..]),
+    }
+}
+
+#[tokio::test]
+async fn application_functions_override_builtins_and_the_like_operator() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let plain = db.connect().unwrap();
+    // Unicode-aware replacements, as SQLite's ICU extension provides.
+    conn.register_scalar_function("like", 2, true, |args| match (&args[0], &args[1]) {
+        (Value::Text(p), Value::Text(t)) => {
+            let fold = |s: &str| s.to_lowercase().chars().collect::<Vec<_>>();
+            Ok(Value::Integer(like_match(&fold(p), &fold(t)) as i64))
+        }
+        _ => Ok(Value::Null),
+    })
+    .unwrap();
+    conn.register_scalar_function("upper", 1, true, |args| match &args[0] {
+        Value::Text(t) => Ok(Value::Text(t.to_uppercase())),
+        other => Ok(other.clone()),
+    })
+    .unwrap();
+    conn.execute("CREATE TABLE p (name TEXT)", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO p VALUES ('Åsa'), ('Anna'), ('åke')", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT 'Åsa' LIKE 'å%', 'Åsa' NOT LIKE 'å%', like('å%', 'Åsa'), upper('åsa')"
+        )
+        .await,
+        vec![vec![
+            Value::Integer(1),
+            Value::Integer(0),
+            Value::Integer(1),
+            Value::Text("ÅSA".into())
+        ]]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT count(*) FROM p WHERE name LIKE 'Å%'").await,
+        vec![vec![Value::Integer(2)]]
+    );
+    // Another connection without the registrations keeps the built-ins.
+    assert_eq!(
+        rows(&plain, "SELECT 'Åsa' LIKE 'å%', upper('åsa')").await,
+        vec![vec![Value::Integer(0), Value::Text("åSA".into())]]
+    );
+}

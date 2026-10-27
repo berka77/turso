@@ -40,19 +40,23 @@ pub(super) fn translate_like_base(
                 program.mark_last_insn_constant();
                 constant_mask = 1;
             }
-            let func = match op {
-                ast::LikeOperator::Like => ScalarFunc::Like,
-                ast::LikeOperator::Glob => ScalarFunc::Glob,
+            let (name, builtin) = match op {
+                ast::LikeOperator::Like => ("like", ScalarFunc::Like),
+                ast::LikeOperator::Glob => ("glob", ScalarFunc::Glob),
                 _ => unreachable!(),
+            };
+            // As in SQLite, the operators call like()/glob(), so an application-defined
+            // like() or glob() (registered on the connection) is used for them too. The
+            // arguments are (pattern, text[, escape]), as for the functions.
+            let func = match resolver.resolve_function(name, arg_count)? {
+                Some(func @ Func::External(_)) => func,
+                _ => Func::Scalar(builtin),
             };
             program.emit_insn(Insn::Function {
                 constant_mask,
                 start_reg,
                 dest: target_register,
-                func: FuncCtx {
-                    func: Func::Scalar(func),
-                    arg_count,
-                },
+                func: FuncCtx { func, arg_count },
             });
         }
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
