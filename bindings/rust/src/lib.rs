@@ -537,6 +537,11 @@ impl Statement {
         self.inner.lock().unwrap().column_count()
     }
 
+    /// Returns the number of parameters the statement takes (the highest parameter index).
+    pub fn parameter_count(&self) -> usize {
+        self.inner.lock().unwrap().parameters_count()
+    }
+
     /// Returns the name of the column at the given index.
     pub fn column_name(&self, idx: usize) -> Result<String> {
         let stmt = self.inner.lock().unwrap();

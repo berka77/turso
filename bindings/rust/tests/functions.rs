@@ -163,3 +163,21 @@ async fn application_functions_override_builtins_and_the_like_operator() {
         vec![vec![Value::Integer(0), Value::Text("åSA".into())]]
     );
 }
+
+#[tokio::test]
+async fn statements_report_their_parameter_count() {
+    let conn = connect().await;
+    conn.execute("CREATE TABLE t (a, b)", ()).await.unwrap();
+    for (sql, n) in [
+        ("SELECT * FROM t", 0),
+        ("SELECT * FROM t WHERE a = ? AND b = ?", 2),
+        ("SELECT * FROM t WHERE a = ?3", 3),
+        ("SELECT * FROM t WHERE a = :x OR b = :x", 1),
+    ] {
+        assert_eq!(
+            conn.prepare(sql).await.unwrap().parameter_count(),
+            n,
+            "{sql}"
+        );
+    }
+}
