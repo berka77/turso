@@ -4,7 +4,7 @@ use crate::{
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
     translate::{
-        aggregation::emit_ungrouped_aggregation,
+        aggregation::{emit_ungrouped_aggregation, init_agg_order_by},
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
@@ -204,6 +204,15 @@ pub fn emit_query<'a>(
             hash_table_id: ctx.hash_table_id,
         });
         emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
+    }
+
+    // Sorters for aggregates with ORDER BY inside the call
+    for agg in plan
+        .aggregates
+        .iter_mut()
+        .filter(|agg| agg.order_by.is_some())
+    {
+        init_agg_order_by(program, agg, &plan.table_references, &t_ctx.resolver)?;
     }
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;

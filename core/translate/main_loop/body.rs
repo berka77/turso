@@ -1,7 +1,7 @@
 use crate::translate::plan::Operation::HashJoin;
 use crate::translate::plan::SimpleAggregate;
 use crate::translate::{
-    aggregation::agg_arg_collation,
+    aggregation::{agg_arg_collation, emit_agg_order_by_step, translate_agg_args},
     order_by::{custom_type_comparator, EmitOrderBy},
     window::EmitWindow,
 };
@@ -312,15 +312,25 @@ fn emit_loop_source<'a>(
                     None
                 };
 
-                translate_aggregation_step(
-                    program,
-                    &plan.table_references,
-                    AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
-                    reg,
-                    &t_ctx.resolver,
-                    agg.fraction_reg,
-                )?;
-                if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                if agg.order_by.is_some() {
+                    let args_reg =
+                        translate_agg_args(program, agg, &plan.table_references, &t_ctx.resolver)?;
+                    emit_agg_order_by_step(program, agg, args_reg);
+                } else {
+                    translate_aggregation_step(
+                        program,
+                        &plan.table_references,
+                        AggArgumentSource::new_from_expression(
+                            &agg.func,
+                            &agg.args,
+                            &agg.distinctness,
+                        ),
+                        reg,
+                        &t_ctx.resolver,
+                        agg.fraction_reg,
+                    )?;
+                }
+                if let (Distinctness::Distinct { ctx }, None) = (&agg.distinctness, &agg.order_by) {
                     let ctx = ctx
                         .as_ref()
                         .expect("distinct aggregate context not populated");

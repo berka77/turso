@@ -1,0 +1,139 @@
+@database :memory:
+
+# ORDER BY inside an aggregate call (SQLite 3.44+), as in
+# group_concat(x, ',' ORDER BY y): the rows reach the aggregate in that order.
+
+setup schema {
+    CREATE TABLE t(g, x, y);
+    INSERT INTO t VALUES (1,'a',3),(1,'B',1),(1,'c',2),(2,'d',2),(2,'E',1),(2,'d',3),(3,NULL,1),(4,'z',NULL),(4,'y',5);
+}
+
+@setup schema
+test ungrouped {
+    SELECT group_concat(x, ',' ORDER BY y, x) FROM t;
+}
+expect {
+    z,B,E,c,d,a,d,y
+}
+
+@setup schema
+test ungrouped-desc-nulls-last {
+    SELECT group_concat(x ORDER BY y DESC NULLS LAST, x) FROM t;
+}
+expect {
+    y,a,d,c,d,B,E,z
+}
+
+@setup schema
+test grouped {
+    SELECT g, group_concat(x, '-' ORDER BY y), group_concat(x, '-' ORDER BY x DESC), count(*) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|B-c-a|c-a-B|3
+    2|E-d-d|d-d-E|3
+    3|||1
+    4|z-y|z-y|2
+}
+
+@setup schema
+test grouped-by-index {
+    CREATE INDEX t_g ON t(g);
+    SELECT g, group_concat(x, ',' ORDER BY y), count(*) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|B,c,a|3
+    2|E,d,d|3
+    3||1
+    4|z,y|2
+}
+
+@setup schema
+test collation {
+    SELECT g, group_concat(x, ',' ORDER BY x COLLATE NOCASE), group_concat(x, ',' ORDER BY x) FROM t WHERE g < 3 GROUP BY g ORDER BY g;
+}
+expect {
+    1|a,B,c|B,a,c
+    2|d,d,E|E,d,d
+}
+
+@setup schema
+test distinct {
+    SELECT g, group_concat(DISTINCT x ORDER BY x DESC) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|c,a,B
+    2|d,E
+    3|
+    4|z,y
+}
+
+@setup schema
+test filter {
+    SELECT g, group_concat(x, ',' ORDER BY y) FILTER (WHERE y > 1) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|c,a
+    2|d,d
+    3|
+    4|y
+}
+
+@setup schema
+test having {
+    SELECT g FROM t GROUP BY g HAVING group_concat(x ORDER BY y) LIKE 'E%' ORDER BY g;
+}
+expect {
+    2
+}
+
+@setup schema
+test no-rows {
+    SELECT group_concat(x, ',' ORDER BY y) IS NULL FROM t WHERE 0;
+}
+expect {
+    1
+}
+
+@setup schema
+test correlated-subquery {
+    SELECT g, (SELECT group_concat(x, '|' ORDER BY y) FROM t t2 WHERE t2.g = t1.g) FROM (SELECT DISTINCT g FROM t) t1 ORDER BY g;
+}
+expect {
+    1|B|c|a
+    2|E|d|d
+    3|
+    4|z|y
+}
+
+@setup schema
+test other-aggregates {
+    SELECT g, string_agg(x, ';' ORDER BY y), json_group_array(x ORDER BY y DESC), max(y ORDER BY x) FROM t WHERE g < 3 GROUP BY g ORDER BY g;
+}
+expect {
+    1|B;c;a|["a","c","B"]|3
+    2|E;d;d|["d","d","E"]|3
+}
+
+@setup schema
+test expression-terms {
+    SELECT group_concat(g || x, ' ' ORDER BY length(x), x DESC) FROM t;
+}
+expect {
+    4z 4y 2d 2d 1c 1a 2E 1B
+}
+
+@setup schema
+test non-aggregate {
+    SELECT upper(x ORDER BY y) FROM t;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate upper()
+}
+
+@setup schema
+test window {
+    SELECT group_concat(x ORDER BY y) OVER () FROM t;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}

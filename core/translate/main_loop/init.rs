@@ -82,7 +82,7 @@ impl InitLoop {
         // Initialize distinct aggregates using hash tables
         for agg in aggregates.iter_mut().filter(|agg| agg.is_distinct()) {
             turso_assert_eq!(
-                agg.args.len(),
+                agg.func_args().len(),
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );

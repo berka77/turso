@@ -3262,6 +3262,29 @@ pub struct Aggregate {
     /// after it has been evaluated and range-checked once per invocation,
     /// before the aggregate row loop. Populated by `InitLoop::emit`.
     pub fraction_reg: Option<usize>,
+    /// `ORDER BY` inside the call, as in `group_concat(x, ',' ORDER BY y)`.
+    pub order_by: Option<AggOrderBy>,
+}
+
+/// The `ORDER BY` of an aggregate call. The ORDER BY expressions are the last
+/// `terms.len()` entries of [Aggregate::args], so they travel with the other
+/// arguments (through the GROUP BY sorter, correlation checks and so on). Each
+/// step stores its arguments in a sorter of its own; when the group ends, the
+/// rows are read back in order and fed to the aggregate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggOrderBy {
+    /// Direction and NULLS placement of each ORDER BY term.
+    pub terms: Vec<(SortOrder, Option<ast::NullsOrder>)>,
+    /// Cursors of the aggregate's sorter. Populated by `InitLoop::emit`.
+    pub ctx: Option<AggOrderByCtx>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AggOrderByCtx {
+    pub sorter_cursor: usize,
+    pub pseudo_cursor: usize,
+    /// Register the sorted rows are read into (the pseudo cursor's content).
+    pub record_reg: usize,
 }
 
 impl Aggregate {
@@ -3279,11 +3302,18 @@ impl Aggregate {
             distinctness,
             filter_expr,
             fraction_reg: None,
+            order_by: None,
         }
     }
 
     pub fn is_distinct(&self) -> bool {
         self.distinctness.is_distinct()
+    }
+
+    /// The arguments the aggregate function itself takes, without the ORDER BY terms.
+    pub fn func_args(&self) -> &[ast::Expr] {
+        let terms = self.order_by.as_ref().map_or(0, |o| o.terms.len());
+        &self.args[..self.args.len() - terms]
     }
 }
 

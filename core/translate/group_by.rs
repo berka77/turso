@@ -9,7 +9,10 @@ use super::{
 };
 use crate::function::AccumulatorFunc;
 use crate::translate::{
-    aggregation::{translate_aggregation_step, AggArgumentSource},
+    aggregation::{
+        emit_agg_order_by_replay, emit_agg_order_by_step, translate_agg_args,
+        translate_aggregation_step, AggArgumentSource,
+    },
     order_by::{custom_type_comparator, EmitOrderBy},
     plan::{Aggregate, NonFromClauseSubquery},
     subquery::emit_non_from_clause_subqueries_for_phase,
@@ -792,17 +795,26 @@ pub fn group_by_process_single_group(
                     None
                 };
 
-                let agg_arg_source =
-                    AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness);
-                translate_aggregation_step(
-                    program,
-                    &plan.table_references,
-                    agg_arg_source,
-                    agg_result_reg,
-                    &t_ctx.resolver,
-                    agg.fraction_reg,
-                )?;
-                if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                if agg.order_by.is_some() {
+                    let args_reg =
+                        translate_agg_args(program, agg, &plan.table_references, &t_ctx.resolver)?;
+                    emit_agg_order_by_step(program, agg, args_reg);
+                } else {
+                    let agg_arg_source = AggArgumentSource::new_from_expression(
+                        &agg.func,
+                        &agg.args,
+                        &agg.distinctness,
+                    );
+                    translate_aggregation_step(
+                        program,
+                        &plan.table_references,
+                        agg_arg_source,
+                        agg_result_reg,
+                        &t_ctx.resolver,
+                        agg.fraction_reg,
+                    )?;
+                }
+                if let (Distinctness::Distinct { ctx }, None) = (&agg.distinctness, &agg.order_by) {
                     let ctx = ctx
                         .as_ref()
                         .expect("distinct aggregate context not populated");
@@ -847,17 +859,21 @@ pub fn group_by_process_single_group(
                 };
 
                 let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
-                let agg_arg_source =
-                    AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg);
-                translate_aggregation_step(
-                    program,
-                    &plan.table_references,
-                    agg_arg_source,
-                    agg_result_reg,
-                    &t_ctx.resolver,
-                    agg.fraction_reg,
-                )?;
-                if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                if agg.order_by.is_some() {
+                    emit_agg_order_by_step(program, agg, start_reg_aggs + offset);
+                } else {
+                    let agg_arg_source =
+                        AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg);
+                    translate_aggregation_step(
+                        program,
+                        &plan.table_references,
+                        agg_arg_source,
+                        agg_result_reg,
+                        &t_ctx.resolver,
+                        agg.fraction_reg,
+                    )?;
+                }
+                if let (Distinctness::Distinct { ctx }, None) = (&agg.distinctness, &agg.order_by) {
                     let ctx = ctx
                         .as_ref()
                         .expect("distinct aggregate context not populated");
@@ -1049,6 +1065,15 @@ pub fn group_by_emit_row_phase<'a>(
             .reg_agg_start
             .expect("aggregate registers must be initialized");
         let agg_result_reg = agg_start_reg + i;
+        if agg.order_by.is_some() {
+            emit_agg_order_by_replay(
+                program,
+                agg,
+                agg_result_reg,
+                &plan.table_references,
+                &t_ctx.resolver,
+            )?;
+        }
         program.emit_insn(Insn::AggFinal {
             register: agg_result_reg,
             func: AccumulatorFunc::Agg(agg.func.clone()),

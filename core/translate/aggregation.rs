@@ -2,12 +2,12 @@ use turso_parser::ast;
 
 use crate::{
     function::{AccumulatorFunc, AggFunc},
-    schema::Table,
+    schema::{PseudoCursorType, Table},
     sync::Arc,
-    translate::collate::CollationSeq,
+    translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq},
     vdbe::{
-        builder::ProgramBuilder,
-        insn::{AggStepData, HashDistinctData, Insn},
+        builder::{CursorType, ProgramBuilder},
+        insn::{to_u32, AggStepData, HashDistinctData, Insn, SorterOpenData},
     },
     LimboError, Result,
 };
@@ -18,13 +18,174 @@ use super::{
         resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
         ConditionMetadata, NoConstantOptReason,
     },
+    order_by::custom_type_comparator,
     plan::{
-        Aggregate, Distinctness, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
-        TableReferences,
+        AggOrderByCtx, Aggregate, Distinctness, NonFromClauseSubquery, SelectPlan,
+        SubqueryEvalPhase, TableReferences,
     },
     result_row::emit_select_result,
     subquery::emit_non_from_clause_subqueries_for_phase,
 };
+
+/// Opens the sorter of an aggregate with `ORDER BY` (see [super::plan::AggOrderBy]): at the start
+/// and again after each group, so every group starts empty. Its rows are the ORDER BY terms
+/// followed by the function's arguments.
+fn emit_agg_sorter_open(
+    program: &mut ProgramBuilder,
+    agg: &Aggregate,
+    ctx: AggOrderByCtx,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<()> {
+    let order_by = agg.order_by.as_ref().expect("aggregate has ORDER BY");
+    let terms = &agg.args[agg.func_args().len()..];
+    let mut order_collations_nulls = crate::alloc::Vec::new();
+    let mut comparators = crate::alloc::Vec::new();
+    for (expr, (order, nulls)) in terms.iter().zip(order_by.terms.iter()) {
+        let collation =
+            get_collseq_from_expr_with_symbols(expr, tables, Some(resolver.symbol_table))?;
+        order_collations_nulls.push((*order, collation, *nulls));
+        comparators.push(custom_type_comparator(expr, tables, resolver.schema()));
+    }
+    program.emit_insn(Insn::SorterOpen {
+        data: Box::new(SorterOpenData {
+            cursor_id: ctx.sorter_cursor,
+            columns: agg.args.len(),
+            order_collations_nulls,
+            comparators,
+        }),
+    });
+    Ok(())
+}
+
+/// Allocates and opens the sorter of an aggregate with `ORDER BY`.
+pub fn init_agg_order_by(
+    program: &mut ProgramBuilder,
+    agg: &mut Aggregate,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<()> {
+    let ctx = AggOrderByCtx {
+        sorter_cursor: program.alloc_cursor_id(CursorType::Sorter),
+        pseudo_cursor: program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+            column_count: agg.args.len(),
+        })),
+        record_reg: program.alloc_register(),
+    };
+    emit_agg_sorter_open(program, agg, ctx, tables, resolver)?;
+    program.emit_insn(Insn::OpenPseudo {
+        cursor_id: ctx.pseudo_cursor,
+        content_reg: ctx.record_reg,
+        num_fields: agg.args.len(),
+    });
+    agg.order_by.as_mut().expect("aggregate has ORDER BY").ctx = Some(ctx);
+    Ok(())
+}
+
+fn agg_order_by_ctx(agg: &Aggregate) -> AggOrderByCtx {
+    agg.order_by
+        .as_ref()
+        .and_then(|o| o.ctx)
+        .expect("aggregate ORDER BY sorter not initialized")
+}
+
+/// Evaluates all of [Aggregate::args] into consecutive registers and returns the first.
+pub fn translate_agg_args(
+    program: &mut ProgramBuilder,
+    agg: &Aggregate,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let args_reg = program.alloc_registers(agg.args.len());
+    for (i, arg) in agg.args.iter().enumerate() {
+        translate_expr(program, Some(tables), arg, args_reg + i, resolver)?;
+    }
+    Ok(args_reg)
+}
+
+/// The step of an aggregate with `ORDER BY`: stores the row in the aggregate's sorter instead of
+/// stepping the function. `args_reg` holds [Aggregate::args] (function arguments, then ORDER BY
+/// terms) in consecutive registers.
+pub fn emit_agg_order_by_step(program: &mut ProgramBuilder, agg: &Aggregate, args_reg: usize) {
+    let ctx = agg_order_by_ctx(agg);
+    let n_func = agg.func_args().len();
+    let n_terms = agg.args.len() - n_func;
+    let row = program.alloc_registers(agg.args.len());
+    program.emit_insn(Insn::Copy {
+        src_reg: args_reg + n_func,
+        dst_reg: row,
+        extra_amount: n_terms - 1,
+    });
+    if n_func > 0 {
+        program.emit_insn(Insn::Copy {
+            src_reg: args_reg,
+            dst_reg: row + n_terms,
+            extra_amount: n_func - 1,
+        });
+    }
+    let record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(row),
+        count: to_u32(agg.args.len()),
+        dest_reg: to_u32(record),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::SorterInsert {
+        cursor_id: ctx.sorter_cursor,
+        record_reg: record,
+    });
+}
+
+/// At the end of a group, before `AggFinal`: feeds the rows of an aggregate with `ORDER BY` to
+/// the function in sorted order, then empties the sorter for the next group.
+pub fn emit_agg_order_by_replay(
+    program: &mut ProgramBuilder,
+    agg: &Aggregate,
+    target_register: usize,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<()> {
+    let ctx = agg_order_by_ctx(agg);
+    let n_func = agg.func_args().len();
+    let n_terms = agg.args.len() - n_func;
+    let done = program.allocate_label();
+    let next_row = program.allocate_label();
+    program.emit_insn(Insn::SorterSort {
+        cursor_id: ctx.sorter_cursor,
+        pc_if_empty: done,
+    });
+    program.preassign_label_to_next_insn(next_row);
+    program.emit_insn(Insn::SorterData {
+        cursor_id: ctx.sorter_cursor,
+        dest_reg: ctx.record_reg,
+        pseudo_cursor: ctx.pseudo_cursor,
+    });
+    let args_reg = program.alloc_registers(n_func.max(1));
+    for i in 0..n_func {
+        program.emit_column_or_rowid(ctx.pseudo_cursor, n_terms + i, args_reg + i);
+    }
+    translate_aggregation_step(
+        program,
+        tables,
+        AggArgumentSource::new_from_registers(args_reg, agg),
+        target_register,
+        resolver,
+        agg.fraction_reg,
+    )?;
+    if let Distinctness::Distinct { ctx } = &agg.distinctness {
+        let ctx = ctx
+            .as_ref()
+            .expect("distinct aggregate context not populated");
+        program.preassign_label_to_next_insn(ctx.label_on_conflict);
+    }
+    program.emit_insn(Insn::SorterNext {
+        cursor_id: ctx.sorter_cursor,
+        pc_if_next: next_row,
+    });
+    program.preassign_label_to_next_insn(done);
+    emit_agg_sorter_open(program, agg, ctx, tables, resolver)
+}
 
 /// Emits the bytecode for processing an aggregate without a GROUP BY clause.
 /// This is called when the main query execution loop has finished processing,
@@ -39,6 +200,15 @@ pub fn emit_ungrouped_aggregation<'a>(
 
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_result_reg = agg_start_reg + i;
+        if agg.order_by.is_some() {
+            emit_agg_order_by_replay(
+                program,
+                agg,
+                agg_result_reg,
+                &plan.table_references,
+                &t_ctx.resolver,
+            )?;
+        }
         program.emit_insn(Insn::AggFinal {
             register: agg_result_reg,
             func: AccumulatorFunc::Agg(agg.func.clone()),
@@ -314,7 +484,7 @@ impl<'a> AggArgumentSource<'a> {
 
     pub fn num_args(&self) -> usize {
         match self {
-            AggArgumentSource::Register { aggregate, .. } => aggregate.args.len(),
+            AggArgumentSource::Register { aggregate, .. } => aggregate.func_args().len(),
             AggArgumentSource::Expression { args, .. } => args.len(),
         }
     }

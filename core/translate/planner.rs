@@ -5,9 +5,10 @@ use super::plan::NamedWindowBound;
 use super::{
     expr::{walk_expr, walk_expr_mut},
     plan::{
-        Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
-        JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
-        Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
+        AggOrderBy, Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt,
+        IterationDirection, JoinInfo, JoinOrderMember, JoinType as PlanJoinType, JoinedTable,
+        Operation, OuterQueryReference, Plan, QueryDestination, ResultSetColumn, Scan,
+        TableReferences, WhereTerm,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -541,6 +542,7 @@ pub fn resolve_window_and_aggregate_functions(
                         Distinctness::NonDistinct,
                         new_agg.func,
                         filter_over.filter_clause.as_deref().cloned(),
+                        None,
                     )?;
                     contains_aggregates = true;
                     return Ok(WalkControl::SkipChildren);
@@ -554,13 +556,41 @@ pub fn resolve_window_and_aggregate_functions(
                     );
                 }
 
-                if !order_by.is_empty() {
-                    crate::bail_parse_error!(
-                        "ORDER BY clause is not supported yet in aggregate functions"
-                    );
-                }
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
+
+                if !order_by.is_empty() {
+                    let Some(Func::Agg(f)) = Func::resolve_function(name.as_str(), args_count)?
+                    else {
+                        crate::bail_parse_error!(
+                            "ORDER BY may not be used with non-aggregate {}()",
+                            name.as_str()
+                        );
+                    };
+                    if filter_over.over_clause.is_some() {
+                        crate::bail_parse_error!(
+                            "ORDER BY may not be used with non-aggregate {}()",
+                            name.as_str()
+                        );
+                    }
+                    let mut args_and_terms = args.clone();
+                    args_and_terms.extend(order_by.iter().map(|term| term.expr.clone()));
+                    let terms = order_by
+                        .iter()
+                        .map(|term| (term.order.unwrap_or(ast::SortOrder::Asc), term.nulls))
+                        .collect();
+                    add_aggregate_if_not_exists(
+                        aggs,
+                        expr,
+                        &args_and_terms,
+                        distinctness,
+                        f,
+                        filter_over.filter_clause.as_deref().cloned(),
+                        Some(AggOrderBy { terms, ctx: None }),
+                    )?;
+                    contains_aggregates = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
 
                 match Func::resolve_function(name.as_str(), args_count)? {
                     Some(Func::Agg(f)) => {
@@ -583,6 +613,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 distinctness,
                                 f,
                                 filter_over.filter_clause.as_deref().cloned(),
+                                None,
                             )?;
                             contains_aggregates = true;
                         }
@@ -631,6 +662,7 @@ pub fn resolve_window_and_aggregate_functions(
                                         distinctness,
                                         func,
                                         filter_over.filter_clause.as_deref().cloned(),
+                                        None,
                                     )?;
                                     contains_aggregates = true;
                                 }
@@ -670,6 +702,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 Distinctness::NonDistinct,
                                 f,
                                 filter_over.filter_clause.as_deref().cloned(),
+                                None,
                             )?;
                             contains_aggregates = true;
                         }
@@ -733,6 +766,7 @@ pub fn resolve_window_and_aggregate_functions(
                                         Distinctness::NonDistinct,
                                         func,
                                         filter_over.filter_clause.as_deref().cloned(),
+                                        None,
                                     )?;
                                     contains_aggregates = true;
                                 }
@@ -1084,15 +1118,19 @@ fn add_aggregate_if_not_exists(
     distinctness: Distinctness,
     func: AggFunc,
     filter_expr: Option<ast::Expr>,
+    order_by: Option<AggOrderBy>,
 ) -> Result<()> {
-    if distinctness.is_distinct() && args.len() != 1 {
+    let terms = order_by.as_ref().map_or(0, |o| o.terms.len());
+    if distinctness.is_distinct() && args.len() - terms != 1 {
         crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
     }
     if aggs
         .iter()
         .all(|a| !exprs_are_equivalent(&a.original_expr, expr))
     {
-        aggs.push(Aggregate::new(func, args, expr, distinctness, filter_expr));
+        let mut agg = Aggregate::new(func, args, expr, distinctness, filter_expr);
+        agg.order_by = order_by;
+        aggs.push(agg);
     }
     Ok(())
 }
