@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::cdc::CaptureDataChangesExt;
 use crate::sync::Arc;
 use crate::{bail_parse_error, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
@@ -20,7 +21,11 @@ use crate::{
         RESERVED_TABLE_PREFIXES,
     },
     translate::{
-        emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
+        emitter::{
+            emit_cdc_autocommit_commit, emit_cdc_insns, emit_check_constraints,
+            gencol::compute_virtual_columns, prepare_cdc_if_necessary, OperationMode, Resolver,
+            UpdateRowSource,
+        },
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
@@ -76,6 +81,108 @@ fn schema_table_name_for_db(resolver: &Resolver, database_id: usize) -> String {
             .unwrap_or_else(|| "main".to_string());
         format!("{db_name}.{SQLITE_TABLEID}")
     }
+}
+
+/// Position of the `sql` column in `sqlite_schema` (type, name, tbl_name, rootpage, sql).
+const SQLITE_SCHEMA_SQL_COLUMN: usize = 4;
+
+/// Records a rewritten `sqlite_schema` row in the CDC table as an UPDATE, so that a CDC
+/// consumer sees renames (ALTER TABLE ... RENAME TO / RENAME COLUMN) like every other schema
+/// change. Rows the rewrite left unchanged are not recorded.
+#[allow(clippy::too_many_arguments)]
+fn emit_schema_rewrite_cdc(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    cdc_cursor_id: usize,
+    rowid_reg: usize,
+    old_columns_reg: usize,
+    new_columns_reg: usize,
+    new_record_reg: usize,
+    column_count: usize,
+    statement: &str,
+) -> Result<()> {
+    let changed = program.allocate_label();
+    let skip = program.allocate_label();
+    for i in 0..column_count {
+        program.emit_insn(Insn::Ne {
+            lhs: old_columns_reg + i,
+            rhs: new_columns_reg + i,
+            target_pc: changed,
+            flags: CmpInsFlags::default().null_eq(),
+            collation: None,
+        });
+    }
+    program.emit_insn(Insn::Goto { target_pc: skip });
+    program.preassign_label_to_next_insn(changed);
+    let before_record_reg = if program.capture_data_changes_info().has_before() {
+        let reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(old_columns_reg),
+            count: to_u32(column_count),
+            dest_reg: to_u32(reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        Some(reg)
+    } else {
+        None
+    };
+    let after_record_reg = if program.capture_data_changes_info().has_after() {
+        Some(new_record_reg)
+    } else {
+        None
+    };
+    // Like the UPDATE that ADD/DROP COLUMN record: a change flag per column, then the new
+    // values, with the statement text in place of the new `sql`.
+    let updates_record_reg = if program.capture_data_changes_info().has_updates() {
+        let start = program.alloc_registers(2 * column_count);
+        for i in 0..column_count {
+            let unchanged = program.allocate_label();
+            program.emit_bool(false, start + i);
+            program.emit_insn(Insn::Eq {
+                lhs: old_columns_reg + i,
+                rhs: new_columns_reg + i,
+                target_pc: unchanged,
+                flags: CmpInsFlags::default().null_eq(),
+                collation: None,
+            });
+            program.emit_bool(true, start + i);
+            program.preassign_label_to_next_insn(unchanged);
+            if i == SQLITE_SCHEMA_SQL_COLUMN {
+                program.emit_string8(statement.to_string(), start + column_count + i);
+            } else {
+                program.emit_insn(Insn::Copy {
+                    src_reg: new_columns_reg + i,
+                    dst_reg: start + column_count + i,
+                    extra_amount: 0,
+                });
+            }
+        }
+        let reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(start),
+            count: to_u32(2 * column_count),
+            dest_reg: to_u32(reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        Some(reg)
+    } else {
+        None
+    };
+    emit_cdc_insns(
+        program,
+        resolver,
+        OperationMode::UPDATE(UpdateRowSource::Normal),
+        cdc_cursor_id,
+        rowid_reg,
+        before_record_reg,
+        after_record_reg,
+        updates_record_reg,
+        SQLITE_TABLEID,
+    )?;
+    program.preassign_label_to_next_insn(skip);
+    Ok(())
 }
 
 fn database_uses_mvcc(connection: &Arc<crate::Connection>, database_id: usize) -> bool {
@@ -1650,6 +1757,10 @@ pub fn translate_alter_table(
                 root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
                 db: database_id,
             });
+            let cdc_cursor_id =
+                prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?
+                    .map(|(cursor_id, _)| cursor_id);
+            let cdc_error = std::cell::RefCell::new(None);
 
             program.cursor_loop(cursor_id, |program, rowid| {
                 let sqlite_schema_column_len = sqlite_schema.columns().len();
@@ -1689,6 +1800,22 @@ pub fn translate_alter_table(
                     affinity_str: None,
                 });
 
+                if let Some(cdc_cursor_id) = cdc_cursor_id {
+                    if let Err(e) = emit_schema_rewrite_cdc(
+                        program,
+                        resolver,
+                        cdc_cursor_id,
+                        rowid,
+                        first_column,
+                        out,
+                        record,
+                        sqlite_schema_column_len,
+                        input,
+                    ) {
+                        cdc_error.borrow_mut().get_or_insert(e);
+                    }
+                }
+
                 // In MVCC mode, we need to delete before insert to properly
                 // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
                 if database_uses_mvcc(connection, database_id) {
@@ -1707,6 +1834,12 @@ pub fn translate_alter_table(
                     table_name: table_name.to_string(),
                 });
             });
+            if let Some(e) = cdc_error.into_inner() {
+                return Err(e);
+            }
+            if let Some(cdc_cursor_id) = cdc_cursor_id {
+                emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+            }
 
             emit_rename_sqlite_sequence_entry(
                 program,
@@ -2121,6 +2254,10 @@ pub fn translate_alter_table(
                 root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
                 db: database_id,
             });
+            let cdc_cursor_id =
+                prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?
+                    .map(|(cursor_id, _)| cursor_id);
+            let cdc_error = std::cell::RefCell::new(None);
 
             program.cursor_loop(cursor_id, |program, rowid| {
                 let sqlite_schema_column_len = sqlite_schema.columns().len();
@@ -2167,6 +2304,22 @@ pub fn translate_alter_table(
                     affinity_str: None,
                 });
 
+                if let Some(cdc_cursor_id) = cdc_cursor_id {
+                    if let Err(e) = emit_schema_rewrite_cdc(
+                        program,
+                        resolver,
+                        cdc_cursor_id,
+                        rowid,
+                        first_column,
+                        out,
+                        record,
+                        sqlite_schema_column_len,
+                        input,
+                    ) {
+                        cdc_error.borrow_mut().get_or_insert(e);
+                    }
+                }
+
                 // In MVCC mode, we need to delete before insert to properly
                 // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
                 if database_uses_mvcc(connection, database_id) {
@@ -2185,6 +2338,12 @@ pub fn translate_alter_table(
                     table_name: table_name.to_string(),
                 });
             });
+            if let Some(e) = cdc_error.into_inner() {
+                return Err(e);
+            }
+            if let Some(cdc_cursor_id) = cdc_cursor_id {
+                emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+            }
 
             // Update trigger SQL for renamed columns
             for (trigger_database_id, trigger_name, new_sql) in triggers_to_rewrite {

@@ -976,6 +976,193 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
     );
 }
 
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_schema_changes_alter_table_rename(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_b ON t(b)").unwrap();
+    let schema_rows = limbo_exec_rows(
+        &conn,
+        "SELECT rowid, rootpage FROM sqlite_schema WHERE name IN ('t', 't_b') ORDER BY name",
+    );
+    let (Value::Integer(t_id), Value::Integer(t_root)) = (&schema_rows[0][0], &schema_rows[0][1])
+    else {
+        panic!("unexpected schema rows: {schema_rows:?}");
+    };
+    let (Value::Integer(i_id), Value::Integer(i_root)) = (&schema_rows[1][0], &schema_rows[1][1])
+    else {
+        panic!("unexpected schema rows: {schema_rows:?}");
+    };
+    let (t_id, t_root, i_id, i_root) = (*t_id, *t_root, *i_id, *i_root);
+    let start = limbo_exec_rows(&conn, "SELECT max(change_id) FROM turso_cdc");
+    let Value::Integer(start) = start[0][0] else {
+        panic!("no change id");
+    };
+
+    conn.execute("ALTER TABLE t RENAME TO u").unwrap();
+    conn.execute("ALTER TABLE u RENAME COLUMN b TO c").unwrap();
+    // Only the rows a rename changes are recorded (not turso_cdc and its version table).
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(
+        &conn,
+        &format!("SELECT * FROM turso_cdc WHERE change_id > {start}"),
+    ));
+
+    let text = |s: &str| Value::Text(s.to_string());
+    let schema_row = |kind: &str, name: &str, tbl: &str, root: i64, sql: &str| {
+        record([
+            text(kind),
+            text(name),
+            text(tbl),
+            Value::Integer(root),
+            text(sql),
+        ])
+    };
+    let updates = |flags: [i64; 5], values: [Value; 5]| {
+        let [v0, v1, v2, v3, v4] = values;
+        record([
+            Value::Integer(flags[0]),
+            Value::Integer(flags[1]),
+            Value::Integer(flags[2]),
+            Value::Integer(flags[3]),
+            Value::Integer(flags[4]),
+            v0,
+            v1,
+            v2,
+            v3,
+            v4,
+        ])
+    };
+    let rename_table = "ALTER TABLE t RENAME TO u";
+    let rename_column = "ALTER TABLE u RENAME COLUMN b TO c";
+    assert_eq!(
+        rows,
+        vec![
+            v2_row(
+                0,
+                "sqlite_schema",
+                t_id,
+                Some(schema_row(
+                    "table",
+                    "t",
+                    "t",
+                    t_root,
+                    "CREATE TABLE t (a INTEGER PRIMARY KEY, b)"
+                )),
+                Some(schema_row(
+                    "table",
+                    "u",
+                    "u",
+                    t_root,
+                    "CREATE TABLE u (a INTEGER PRIMARY KEY, b)"
+                )),
+                Some(updates(
+                    [0, 1, 1, 0, 1],
+                    [
+                        text("table"),
+                        text("u"),
+                        text("u"),
+                        Value::Integer(t_root),
+                        text(rename_table)
+                    ],
+                )),
+            ),
+            v2_row(
+                0,
+                "sqlite_schema",
+                i_id,
+                Some(schema_row(
+                    "index",
+                    "t_b",
+                    "t",
+                    i_root,
+                    "CREATE INDEX t_b ON t (b)"
+                )),
+                Some(schema_row(
+                    "index",
+                    "t_b",
+                    "u",
+                    i_root,
+                    "CREATE INDEX t_b ON u (b)"
+                )),
+                Some(updates(
+                    [0, 0, 1, 0, 1],
+                    [
+                        text("index"),
+                        text("t_b"),
+                        text("u"),
+                        Value::Integer(i_root),
+                        text(rename_table)
+                    ],
+                )),
+            ),
+            v2_commit(),
+            v2_row(
+                0,
+                "sqlite_schema",
+                t_id,
+                Some(schema_row(
+                    "table",
+                    "u",
+                    "u",
+                    t_root,
+                    "CREATE TABLE u (a INTEGER PRIMARY KEY, b)"
+                )),
+                Some(schema_row(
+                    "table",
+                    "u",
+                    "u",
+                    t_root,
+                    "CREATE TABLE u (a INTEGER PRIMARY KEY, c)"
+                )),
+                Some(updates(
+                    [0, 0, 0, 0, 1],
+                    [
+                        text("table"),
+                        text("u"),
+                        text("u"),
+                        Value::Integer(t_root),
+                        text(rename_column)
+                    ],
+                )),
+            ),
+            v2_row(
+                0,
+                "sqlite_schema",
+                i_id,
+                Some(schema_row(
+                    "index",
+                    "t_b",
+                    "u",
+                    i_root,
+                    "CREATE INDEX t_b ON u (b)"
+                )),
+                Some(schema_row(
+                    "index",
+                    "t_b",
+                    "u",
+                    i_root,
+                    "CREATE INDEX t_b ON u (c)"
+                )),
+                Some(updates(
+                    [0, 0, 0, 0, 1],
+                    [
+                        text("index"),
+                        text("t_b"),
+                        text("u"),
+                        Value::Integer(i_root),
+                        text(rename_column)
+                    ],
+                )),
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
 #[turso_macros::test]
 fn test_cdc_version_table_created(db: TempDatabase) {
     let conn = db.connect_limbo();
