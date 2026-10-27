@@ -1213,26 +1213,7 @@ impl Statement {
             return Some(column_types.get(idx).expect("No column").to_string());
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column {
-                table,
-                column: column_idx,
-                ..
-            } => {
-                let (_, table_ref) = self
-                    .program
-                    .table_references
-                    .find_table_by_internal_id(*table)?;
-                let table_column = table_ref.get_column_at(*column_idx)?;
-                let ty_str = &table_column.ty_str;
-                if ty_str.is_empty() {
-                    None
-                } else {
-                    Some(ty_str.clone())
-                }
-            }
-            _ => None,
-        }
+        declared_type_of(&column.expr, &self.program.table_references)
     }
 
     /// Returns rich type information for a result column.
@@ -1783,6 +1764,32 @@ impl Drop for Statement {
             self.nested_guard_active = false;
         }
     }
+}
+
+/// The declared type behind a result column expression: a table column's declared type, followed
+/// through subqueries, CTEs and the subquery a window function is planned as, as SQLite's
+/// `sqlite3_column_decltype()` does. Columns of a subquery carry only an affinity, which is not
+/// what the table declared. `None` for expressions.
+fn declared_type_of(
+    expr: &turso_parser::ast::Expr,
+    tables: &translate::plan::TableReferences,
+) -> Option<String> {
+    let turso_parser::ast::Expr::Column { table, column, .. } = expr else {
+        return None;
+    };
+    let (_, table_ref) = tables.find_table_by_internal_id(*table)?;
+    if let crate::schema::Table::FromClauseSubquery(subquery) = table_ref {
+        let select = match subquery.plan.as_ref() {
+            translate::plan::Plan::Select(select) => select.as_ref(),
+            // SQLite takes a compound subquery's types from its last select.
+            translate::plan::Plan::CompoundSelect { right_most, .. } => right_most.as_ref(),
+            _ => return None,
+        };
+        let inner = select.result_columns.get(*column)?;
+        return declared_type_of(&inner.expr, &select.table_references);
+    }
+    let ty_str = &table_ref.get_column_at(*column)?.ty_str;
+    (!ty_str.is_empty()).then(|| ty_str.clone())
 }
 
 #[cfg(test)]

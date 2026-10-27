@@ -41,6 +41,46 @@ mod tests {
             .unwrap_or_else(|| panic!("get_column_type_info({idx}) returned None"))
     }
 
+    /// `get_column_decltype` follows a result column through subqueries, CTEs, compound
+    /// selects and the subquery a window function is planned as, to the declared type of the
+    /// table column behind it, exactly as SQLite's `sqlite3_column_decltype()` does.
+    #[test]
+    fn decltype_matches_sqlite_through_subqueries_ctes_and_windows() {
+        let schema =
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, flag BOOLEAN, name TEXT, at DATETIME, n)";
+        let db = TempDatabase::builder()
+            .with_db_name("decltype_through_subqueries.db")
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute(schema).unwrap();
+        let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+        sqlite.execute(schema, []).unwrap();
+        for sql in [
+            "SELECT id, flag, name, at, n FROM t",
+            "SELECT id, flag, at, count(*) OVER () AS c FROM t",
+            "SELECT flag, row_number() OVER (PARTITION BY flag ORDER BY at) FROM t",
+            "SELECT * FROM (SELECT id, flag, at FROM t)",
+            "SELECT x.flag FROM (SELECT * FROM (SELECT flag FROM t)) AS x",
+            "WITH c AS (SELECT flag, at FROM t) SELECT flag, at FROM c",
+            "SELECT flag, at FROM t UNION ALL SELECT name, id FROM t",
+            "SELECT * FROM (SELECT flag FROM t UNION SELECT name FROM t)",
+            "SELECT * FROM (SELECT flag + 1 AS f, upper(name) AS u FROM t)",
+            "SELECT flag, count(*) FROM t GROUP BY flag",
+        ] {
+            let ours = conn.prepare(sql).unwrap();
+            let got: Vec<Option<String>> = (0..ours.num_columns())
+                .map(|i| ours.get_column_decltype(i))
+                .collect();
+            let theirs = sqlite.prepare(sql).unwrap();
+            let expected: Vec<Option<String>> = theirs
+                .columns()
+                .iter()
+                .map(|c| c.decl_type().map(String::from))
+                .collect();
+            assert_eq!(got, expected, "{sql}");
+        }
+    }
+
     /// Built-in scalar columns: `array_dimensions == 0`, no `base_type`
     /// (declared name is itself the primitive), `kind == Builtin`.
     #[test]
