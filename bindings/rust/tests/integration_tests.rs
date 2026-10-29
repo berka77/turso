@@ -2655,3 +2655,32 @@ async fn test_transactional_batch_joins_an_open_transaction() {
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 0);
 }
+
+#[tokio::test]
+async fn deleting_rows_that_refer_to_each_other_checks_at_the_end_of_the_statement() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    for sql in [
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, origin INTEGER REFERENCES c(id))",
+        "CREATE TABLE u (k TEXT PRIMARY KEY, up TEXT REFERENCES u(k))",
+        "INSERT INTO c VALUES (1, NULL), (2, 1), (3, 2), (4, NULL)",
+        "INSERT INTO u VALUES ('a', NULL), ('b', 'a'), ('c', 'b')",
+    ] {
+        conn.execute(sql, ()).await.unwrap();
+    }
+    // As in SQLite: a statement that removes a parent and the rows referring to it succeeds.
+    conn.execute("DELETE FROM c WHERE id <> 4", ())
+        .await
+        .unwrap();
+    conn.execute("DELETE FROM u", ()).await.unwrap();
+    // A parent whose child stays is still refused, and nothing is deleted.
+    conn.execute("INSERT INTO c VALUES (5, 4)", ())
+        .await
+        .unwrap();
+    let err = conn.execute("DELETE FROM c WHERE id = 4", ()).await;
+    assert!(matches!(err, Err(Error::Constraint(_))), "{err:?}");
+    let mut rows = conn.query("SELECT count(*) FROM c", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get_value(0).unwrap(), Value::Integer(2));
+}

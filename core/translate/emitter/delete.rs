@@ -292,9 +292,9 @@ pub fn emit_fk_child_decrement_on_delete(
     for fk_ref in
         resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
     {
-        if !fk_ref.fk.deferred {
-            continue;
-        }
+        // Immediate keys too, on the statement's counter (as SQLite's fkLookupParent with a
+        // negative increment): a statement deleting a parent and later its children, such as
+        // DELETE on a table that refers to itself, must not fail on the children it removes.
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
         for cname in &fk_ref.fk.child_columns {
@@ -365,7 +365,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
             program.preassign_label_to_next_insn(missing);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_guarded_fk_decrement(program, done, true);
+            emit_guarded_fk_decrement(program, done, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(done);
         } else {
             // Probe parent unique index
@@ -412,7 +412,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 num_regs: n,
             });
             program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, ok, true);
+            emit_guarded_fk_decrement(program, ok, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(ok);
             program.emit_insn(Insn::Close { cursor_id: icur });
         }
