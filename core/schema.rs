@@ -6153,7 +6153,7 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
@@ -6167,9 +6167,12 @@ impl Index {
             })
         };
         let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
+        // Through the connection, so that functions it registered (deterministic ones) count.
         let is_deterministic_fn = |name: &str, argc: usize| {
             let n = normalize_ident(name);
-            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
+            resolver
+                .resolve_function(&n, argc)
+                .is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
         };
 
         let mut ok = true;

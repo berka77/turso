@@ -181,3 +181,89 @@ async fn statements_report_their_parameter_count() {
         );
     }
 }
+
+/// Digits of a value, as an application function (a stand-in for REGEXP_REPLACE).
+fn digits(args: &[Value]) -> Result<Value, String> {
+    Ok(match &args[0] {
+        Value::Text(s) => Value::Text(s.chars().filter(char::is_ascii_digit).collect()),
+        _ => Value::Null,
+    })
+}
+
+#[tokio::test]
+async fn deterministic_application_functions_can_be_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let open = || async {
+        let db = Builder::new_local(path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.register_scalar_function("digits", 1, true, digits)
+            .unwrap();
+        conn.register_scalar_function("rand_digits", 1, false, digits)
+            .unwrap();
+        (db, conn)
+    };
+    let (db, conn) = open().await;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, phone TEXT)", ())
+        .await
+        .unwrap();
+    conn.execute("CREATE INDEX t_digits ON t (digits(phone))", ())
+        .await
+        .unwrap();
+    // As in SQLite, a function that may return different results cannot be indexed.
+    assert!(conn
+        .execute("CREATE INDEX t_rand ON t (rand_digits(phone))", ())
+        .await
+        .is_err());
+    conn.execute(
+        "INSERT INTO t (phone) SELECT '070-' || value FROM generate_series(1, 2000)",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute("UPDATE t SET phone = '08 12' WHERE id = 7", ())
+        .await
+        .unwrap();
+    let plan = |sql: &'static str| {
+        let conn = &conn;
+        async move {
+            format!(
+                "{:?}",
+                rows(conn, &format!("EXPLAIN QUERY PLAN {sql}")).await
+            )
+        }
+    };
+    assert!(
+        plan("SELECT id FROM t WHERE digits(phone) = '0812'")
+            .await
+            .contains("USING INDEX t_digits"),
+        "the index is used"
+    );
+    assert_eq!(
+        rows(&conn, "SELECT id FROM t WHERE digits(phone) = '0812'").await,
+        vec![vec![Value::Integer(7)]],
+        "the index follows updates"
+    );
+    assert!(rows(&conn, "SELECT id FROM t WHERE digits(phone) = '0707'")
+        .await
+        .is_empty());
+    drop(conn);
+    drop(db);
+
+    // The schema loads again, and a connection that registered the function keeps using it.
+    let (_db, conn) = open().await;
+    assert_eq!(
+        rows(&conn, "SELECT id FROM t WHERE digits(phone) = '07012'").await,
+        vec![vec![Value::Integer(12)]]
+    );
+    conn.execute("INSERT INTO t (phone) VALUES ('+46 (0)70')", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT phone FROM t WHERE digits(phone) = '46070'").await,
+        vec![vec![Value::Text("+46 (0)70".into())]]
+    );
+}

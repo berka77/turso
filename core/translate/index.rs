@@ -946,7 +946,7 @@ fn resolve_sorted_columns_with_resolver(
                 .expect("resolved index columns vector was preallocated to cols.len()");
             continue;
         }
-        if !validate_index_expression(unwrapped_expr, table) {
+        if !validate_index_expression(unwrapped_expr, table, resolver) {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
         resolved
@@ -1035,7 +1035,10 @@ fn resolve_index_column<'a>(
 /// Expressions in CREATE INDEX statements may not use subqueries.
 /// Additionally, a standalone string literal is interpreted as a column name (for backwards
 /// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
-fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+/// `resolver` is the connection's when an index is created: functions it registered count, and
+/// must be deterministic. Without one (an index read from an existing schema, checked when it
+/// was created) a function that is not built in is accepted, as SQLite resolves it when used.
+fn validate_index_expression(expr: &Expr, table: &BTreeTable, resolver: Option<&Resolver>) -> bool {
     // A top-level string literal would have been handled by resolve_index_column().
     // If we get here with a string literal, it means the column doesn't exist.
     // (SQLite interprets standalone string literals as column names for backwards compat.)
@@ -1055,8 +1058,14 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
     let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
         let n = normalize_ident(name);
-        Func::resolve_function(&n, args.len())
-            .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
+        match resolver {
+            Some(r) => r.resolve_function(&n, args.len()),
+            None => Func::resolve_function(&n, args.len()),
+        }
+        .is_ok_and(|f| match f {
+            Some(f) => is_deterministic_schema_function_call(&f, args),
+            None => resolver.is_none(),
+        })
     };
 
     let mut ok = true;
