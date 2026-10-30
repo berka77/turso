@@ -269,7 +269,56 @@ fn strength_from_locale(locale: &Locale) -> Option<Strength> {
 
 struct LocaleCollation {
     name: String,
-    collator: CollatorBorrowed<'static>,
+    comparator: Comparator,
+}
+
+/// Compares two strings for a collation registered with [`register_process_collation`].
+pub type ProcessCollationCompare = std::sync::Arc<dyn Fn(&str, &str) -> Ordering + Send + Sync>;
+/// Maps a string to a key that is equal for exactly the strings the collation finds equal
+/// (used to hash, for example in hash joins and `DISTINCT`).
+pub type ProcessCollationKey = std::sync::Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
+
+enum Comparator {
+    Icu(CollatorBorrowed<'static>),
+    Process {
+        compare: ProcessCollationCompare,
+        key: ProcessCollationKey,
+    },
+}
+
+/// Register a collation for the whole process. Unlike a connection's collation it may be used
+/// in table and index definitions, as a locale collation may: every connection that reads
+/// the schema finds it. Register it before opening a database whose schema names it; a name
+/// can be registered once.
+pub fn register_process_collation(
+    name: &str,
+    compare: ProcessCollationCompare,
+    key: ProcessCollationKey,
+) -> Result<()> {
+    if matches!(
+        crate::util::normalize_ident(name).as_str(),
+        "binary" | "nocase" | "rtrim"
+    ) {
+        return Err(crate::LimboError::ParseError(format!(
+            "collation {name} is built in"
+        )));
+    }
+    let registry = LocaleCollationRegistry::global();
+    let mut collations = registry.collations.write();
+    if collations
+        .iter()
+        .any(|collation| collation.name.eq_ignore_ascii_case(name))
+    {
+        return Err(crate::LimboError::ParseError(format!(
+            "collation {name} is already registered"
+        )));
+    }
+    LocaleCollationId::from_index(collations.len())?;
+    collations.push(LocaleCollation {
+        name: name.to_string(),
+        comparator: Comparator::Process { compare, key },
+    });
+    Ok(())
 }
 
 struct LocaleCollationRegistry {
@@ -310,7 +359,7 @@ impl LocaleCollationRegistry {
         let id = LocaleCollationId::from_index(collations.len())?;
         collations.push(LocaleCollation {
             name: name.to_string(),
-            collator,
+            comparator: Comparator::Icu(collator),
         });
         Ok(id)
     }
@@ -325,17 +374,22 @@ impl LocaleCollationRegistry {
     }
 
     fn compare(&self, id: LocaleCollationId, lhs: &str, rhs: &str) -> Ordering {
-        self.with_collation(id, |collation| collation.collator.compare(lhs, rhs))
+        self.with_collation(id, |collation| match &collation.comparator {
+            Comparator::Icu(collator) => collator.compare(lhs, rhs),
+            Comparator::Process { compare, .. } => compare(lhs, rhs),
+        })
     }
 
     fn sort_key(&self, id: LocaleCollationId, text: &str) -> Vec<u8> {
-        self.with_collation(id, |collation| {
-            let mut key = Vec::new();
-            collation
-                .collator
-                .write_sort_key_to(text, &mut key)
-                .expect("Vec collation key sink should be infallible");
-            key
+        self.with_collation(id, |collation| match &collation.comparator {
+            Comparator::Icu(collator) => {
+                let mut key = Vec::new();
+                collator
+                    .write_sort_key_to(text, &mut key)
+                    .expect("Vec collation key sink should be infallible");
+                key
+            }
+            Comparator::Process { key, .. } => key(text),
         })
     }
 

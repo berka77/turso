@@ -15,11 +15,29 @@ use crate::{Error, Result, Value};
 type CollationFn = dyn Fn(&str, &str) -> Ordering + Send + Sync + 'static;
 type ScalarFn = dyn Fn(&[Value]) -> std::result::Result<Value, String> + Send + Sync + 'static;
 
+/// Register a collation for the whole process under `name`, usable everywhere a locale
+/// collation is, table and index definitions included. `compare` must be a total order, and
+/// `key` must give equal keys exactly for the strings `compare` finds equal (it is used to
+/// hash). Register before opening a database whose schema names the collation; a name can be
+/// registered once.
+pub fn register_process_collation<C, K>(name: &str, compare: C, key: K) -> Result<()>
+where
+    C: Fn(&str, &str) -> Ordering + Send + Sync + 'static,
+    K: Fn(&str) -> Vec<u8> + Send + Sync + 'static,
+{
+    turso_core::register_process_collation(
+        name,
+        std::sync::Arc::new(compare),
+        std::sync::Arc::new(key),
+    )
+    .map_err(|e| Error::Error(e.to_string()))
+}
+
 impl Connection {
     /// Register a collation under `name` for this connection, for use as `COLLATE name` in
     /// queries (`ORDER BY`, comparisons). It must be a total order. Connection-local collations
     /// cannot appear in table or index definitions, which every connection shares; use a locale
-    /// collation (`COLLATE "sv-u-ks-level1"`) there. Registering the same name again replaces
+    /// collation (`COLLATE "sv-u-ks-level1"`) or [`register_process_collation`] there. Registering the same name again replaces
     /// the earlier collation.
     pub fn register_collation<F>(&self, name: &str, compare: F) -> Result<()>
     where

@@ -52,6 +52,63 @@ async fn application_collation_orders_and_compares_in_queries() {
 }
 
 #[tokio::test]
+async fn process_collation_holds_in_tables_and_unique_indexes() {
+    // Equal ignoring ASCII case and trailing spaces.
+    fn fold(s: &str) -> String {
+        s.trim_end_matches(' ').to_ascii_lowercase()
+    }
+    turso::register_process_collation(
+        "test_fold_ci",
+        |a, b| fold(a).cmp(&fold(b)),
+        |s| fold(s).into_bytes(),
+    )
+    .unwrap();
+    assert!(
+        turso::register_process_collation("test_fold_ci", |a, b| a.cmp(b), |s| s.into()).is_err()
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let path = path.to_str().unwrap();
+    {
+        let db = Builder::new_local(path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t (v TEXT COLLATE test_fold_ci UNIQUE)", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('Abc')", ())
+            .await
+            .unwrap();
+        assert!(conn
+            .execute("INSERT INTO t VALUES ('aBC ')", ())
+            .await
+            .is_err());
+    }
+    // A new database object reads the schema back with the collation.
+    let db = Builder::new_local(path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    assert!(conn
+        .execute("INSERT INTO t VALUES ('ABC')", ())
+        .await
+        .is_err());
+    conn.execute("INSERT INTO t VALUES ('b')", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT count(*) FROM t WHERE v = 'abc  '").await,
+        vec![vec![Value::Integer(1)]]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT count(DISTINCT v) FROM (SELECT v FROM t UNION ALL SELECT 'B')"
+        )
+        .await,
+        vec![vec![Value::Integer(2)]]
+    );
+}
+
+#[tokio::test]
 async fn application_scalar_function_gets_arguments_and_returns_values_and_errors() {
     let conn = connect().await;
     conn.register_scalar_function("quarter", 1, true, |args| match &args[0] {

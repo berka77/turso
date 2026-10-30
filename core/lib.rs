@@ -136,6 +136,9 @@ pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{Dialect, SqliteDialect};
 pub use error::{io_error, CompletionError, LimboError};
 pub use function::ContextCollationFunction;
+pub use translate::collate::{
+    register_process_collation, ProcessCollationCompare, ProcessCollationKey,
+};
 #[cfg(feature = "io_memory_yield")]
 pub use io::MemoryYieldIO;
 #[cfg(all(feature = "fs", target_family = "unix", not(miri)))]

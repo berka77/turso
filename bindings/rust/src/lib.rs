@@ -49,6 +49,7 @@ pub mod sync;
 
 pub use batch::{BatchResult, BatchStatement, IntoBatchStatement};
 pub use connection::Connection;
+pub use functions::register_process_collation;
 use turso_sdk_kit::rsapi::TursoError;
 pub use turso_sdk_kit::IoBackend;
 pub use value::Value;
