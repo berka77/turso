@@ -11,6 +11,17 @@ macro_rules! trace_stack {
 }
 pub(crate) use trace_stack;
 
+/// Refuse to compile one recursion level deeper when the thread's stack is nearly used up
+/// (see [`turso_parser::STACK_MARGIN`]).
+pub(crate) fn ensure_stack() -> crate::Result<()> {
+    if turso_parser::stack_exhausted() {
+        return Err(crate::LimboError::ParseError(
+            "statement is too deeply nested".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "stacker")]
 pub(crate) struct TraceGuard {
     label: &'static str,

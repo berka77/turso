@@ -7350,6 +7350,7 @@ dependencies = [
  "miette",
  "pprof 0.14.0",
  "serde",
+ "stacker",
  "strum",
  "strum_macros",
  "thiserror 2.0.16",

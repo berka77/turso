@@ -2684,3 +2684,69 @@ async fn deleting_rows_that_refer_to_each_other_checks_at_the_end_of_the_stateme
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get_value(0).unwrap(), Value::Integer(2));
 }
+
+// Parsing and planning recurse once per nesting level. A statement nested deeper than the
+// thread's stack allows is refused with an error; overflowing the stack would abort the process.
+#[test]
+fn deeply_nested_statements_are_refused_not_overflowed() {
+    let n = 5000;
+    let statements = [
+        // Compound SELECT terms.
+        (0..n)
+            .map(|i| format!("SELECT {i}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL "),
+        // Subqueries nested in FROM.
+        format!(
+            "SELECT * FROM {}(SELECT 1 AS a){}",
+            "(SELECT * FROM ".repeat(n),
+            ")".repeat(n)
+        ),
+        // A chain of CTEs, each reading the one before.
+        format!(
+            "WITH c0 AS (SELECT 1 AS a), {} SELECT * FROM c{}",
+            (1..n)
+                .map(|i| format!("c{i} AS (SELECT a FROM c{})", i - 1))
+                .collect::<Vec<_>>()
+                .join(", "),
+            n - 1
+        ),
+    ];
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let db = Builder::new_local(":memory:").build().await.unwrap();
+                    let conn = db.connect().unwrap();
+                    for sql in &statements {
+                        let err = conn.prepare(sql).await.err().map(|e| e.to_string());
+                        assert!(
+                            err.as_deref()
+                                .is_some_and(|e| e.contains("statement is too deeply nested")),
+                            "{err:?} for {}...",
+                            &sql[..60]
+                        );
+                    }
+                    // A shallow statement of each kind still works on the same thread.
+                    let mut rows = conn
+                        .query(
+                            "WITH c AS (SELECT 1 AS a) \
+                             SELECT a FROM (SELECT a FROM c) UNION ALL SELECT 2",
+                            (),
+                        )
+                        .await
+                        .unwrap();
+                    let mut count = 0;
+                    while rows.next().await.unwrap().is_some() {
+                        count += 1;
+                    }
+                    assert_eq!(count, 2);
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

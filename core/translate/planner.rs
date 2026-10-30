@@ -5,9 +5,9 @@ use super::plan::NamedWindowBound;
 use super::{
     expr::{find_unqualified_column, walk_expr, walk_expr_mut},
     plan::{
-        query_output_columns, AggOrderBy, Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt,
-        IterationDirection, JoinInfo, JoinOrderMember, JoinType as PlanJoinType, JoinedTable,
-        Operation, OuterQueryReference, Plan, QueryDestination, ResultSetColumn, Scan,
+        query_output_columns, AggOrderBy, Aggregate, ColumnMask, ColumnUsedMask, Distinctness,
+        EvalAt, IterationDirection, JoinInfo, JoinOrderMember, JoinType as PlanJoinType,
+        JoinedTable, Operation, OuterQueryReference, Plan, QueryDestination, ResultSetColumn, Scan,
         TableReferences, WhereTerm,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
@@ -1234,6 +1234,7 @@ fn plan_cte(
     connection: &Arc<crate::Connection>,
     validate_explicit_column_count: bool,
 ) -> Result<JoinedTable> {
+    crate::stack::ensure_stack()?;
     let cte_definition = &cte_definitions[cte_definition_index];
     if program.is_cte_being_defined(&cte_definition.name) {
         crate::bail_parse_error!("circular reference: {}", cte_definition.name);
@@ -2449,6 +2450,7 @@ pub fn parse_from(
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    crate::stack::ensure_stack()?;
     let mut cte_definitions = Vec::new();
     let mut shadowed_outer_ctes = Vec::new();
 

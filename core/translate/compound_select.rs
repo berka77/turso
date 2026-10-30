@@ -271,6 +271,7 @@ fn emit_compound_select(
     reg_result_cols_start: Option<usize>,
     query_destination: &QueryDestination,
 ) -> crate::Result<()> {
+    crate::stack::ensure_stack()?;
     let compound_select_end = program.allocate_label();
     if let Some(limit_ctx) = &limit_ctx {
         program.emit_insn(Insn::IfNot {

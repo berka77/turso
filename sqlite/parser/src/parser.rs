@@ -2090,10 +2090,20 @@ impl<'a> Parser<'a> {
         Ok(exprs)
     }
 
+    fn ensure_stack(&self) -> Result<()> {
+        if crate::stack_exhausted() {
+            return Err(Error::ParseError(
+                "statement is too deeply nested".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Parse an expression, bounding both the parser's recursion depth and the
     /// height of the resulting tree by [`MAX_EXPR_DEPTH`]. On return,
     /// `last_expr_height` holds the height of the returned expression.
     fn parse_expr(&mut self, precedence: u8) -> Result<Box<Expr>> {
+        self.ensure_stack()?;
         self.expr_nesting_depth += 1;
         if self.expr_nesting_depth as usize > MAX_EXPR_DEPTH {
             self.expr_nesting_depth -= 1;
@@ -3386,6 +3396,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
+        self.ensure_stack()?;
         let with = self.parse_with()?;
         self.parse_select_without_cte(with)
     }

@@ -98,6 +98,7 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    crate::stack::ensure_stack()?;
     let constant_span = if expr.is_constant(resolver) {
         if !program.constant_span_is_open() {
             Some(program.constant_span_start())

@@ -39,6 +39,7 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
+    crate::stack::ensure_stack()?;
     let plan = prepare_select_plan(
         select,
         resolver,
@@ -165,6 +166,7 @@ pub fn prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    crate::stack::ensure_stack()?;
     prepare_select_plan_from_arms(
         select.body.select,
         select.body.compounds,
