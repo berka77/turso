@@ -1060,6 +1060,32 @@ pub fn constraints_from_where_clause(
                             null_matching: false,
                         });
                     }
+                    // An expression of this table only: an expression index on it can drive
+                    // the IN seek, as it drives an equality.
+                    lhs if expression_matches_table(
+                        lhs,
+                        table_reference,
+                        table_references,
+                        subqueries,
+                    ) =>
+                    {
+                        cs.constraints.push(Constraint {
+                            where_clause_pos: (i, BinaryExprSide::Rhs),
+                            operator: ConstraintOperator::In {
+                                not: *not,
+                                estimated_values,
+                            },
+                            table_col_pos: None,
+                            expr: Some(lhs.clone()),
+                            constraining_expr: None,
+                            lhs_mask: rhs_mask,
+                            selectivity,
+                            usable: false,
+                            is_rowid: false,
+                            comparison_affinity: cmp_aff,
+                            null_matching: false,
+                        });
+                    }
                     _ => {}
                 }
             }

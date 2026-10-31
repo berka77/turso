@@ -9,7 +9,9 @@ use turso_parser::ast::{self, SortOrder, TableInternalId};
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
+use crate::translate::collate::get_collseq_from_expr;
 use crate::translate::expr::{as_binary_components, comparison_affinity, walk_expr, WalkControl};
+use crate::translate::expression_index::normalize_expr_for_index_matching;
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, expr_uses_custom_collation, ordered_ephemeral_key_columns,
     partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
@@ -574,15 +576,29 @@ pub(super) fn choose_best_in_seek_candidate(
                 continue;
             }
 
-            let matches = if candidate.index.is_none() {
-                constraint.is_rowid
-            } else {
-                !constraint.is_rowid
-                    && constraint.table_col_pos.is_some()
-                    && constraint.table_col_pos == first_col_pos
+            let matches = match (&candidate.index, &constraint.expr) {
+                (None, _) => constraint.is_rowid,
+                // An expression index whose first key is the IN list's left side.
+                (Some(index), Some(expr)) => {
+                    let expr = normalize_expr_for_index_matching(expr, rhs_table, table_references);
+                    index.expression_to_index_pos(&expr) == Some(0)
+                }
+                (Some(_), None) => {
+                    !constraint.is_rowid
+                        && constraint.table_col_pos.is_some()
+                        && constraint.table_col_pos == first_col_pos
+                }
             };
             if !matches {
                 continue;
+            }
+            // The same for an expression: the IN comparison uses the expression's collation.
+            if let (Some(index), Some(expr)) = (&candidate.index, &constraint.expr) {
+                let expr_collation =
+                    get_collseq_from_expr(expr, table_references)?.unwrap_or_default();
+                if expr_collation != index.columns[0].collation.unwrap_or_default() {
+                    continue;
+                }
             }
 
             // `open_loop` copies the chosen index collation onto the ephemeral
@@ -626,6 +642,8 @@ pub(super) fn choose_best_in_seek_candidate(
                     .get(col_pos)
                     .map(|col| col.affinity())
                     .unwrap_or(Affinity::Blob)
+            } else if constraint.expr.is_some() {
+                constraint.comparison_affinity.unwrap_or(Affinity::Blob)
             } else {
                 Affinity::Integer
             };

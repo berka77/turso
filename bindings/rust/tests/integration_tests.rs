@@ -2687,6 +2687,61 @@ async fn deleting_rows_that_refer_to_each_other_checks_at_the_end_of_the_stateme
 
 // Parsing and planning recurse once per nesting level. A statement nested deeper than the
 // thread's stack allows is refused with an error; overflowing the stack would abort the process.
+/// An expression index drives an IN list as it drives an equality (SQLite does too).
+#[tokio::test]
+async fn an_expression_index_serves_an_in_list() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, phone TEXT, name TEXT)",
+        "CREATE INDEX p_digits ON p (replace(replace(phone, '-', ''), ' ', ''))",
+        "CREATE INDEX p_lower ON p (lower(name) COLLATE NOCASE)",
+        "INSERT INTO p (phone, name) SELECT '070-' || value || ' 00', 'Name' || value \
+         FROM generate_series(1, 2000)",
+        "INSERT INTO p (phone, name) VALUES (NULL, NULL), ('070-5 00', 'twin')",
+    ] {
+        conn.execute(sql, ()).await.unwrap();
+    }
+    // Column `col` of every row.
+    let column = |sql: String, col: usize| {
+        let conn = conn.clone();
+        async move {
+            let mut rows = conn.query(&sql, ()).await.unwrap();
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                out.push(format!("{:?}", row.get_value(col).unwrap()));
+            }
+            out
+        }
+    };
+    let plan = |sql: &str| column(format!("EXPLAIN QUERY PLAN {sql}"), 3);
+    let digits = "SELECT id FROM p WHERE replace(replace(phone, '-', ''), ' ', '') \
+                  IN ('070500', '0701200', NULL, '070500', 'x') ORDER BY id";
+    let p = plan(digits).await;
+    assert!(format!("{p:?}").contains("p_digits"), "{p:?}");
+    // Every match once, in spite of the duplicate and the NULL in the list.
+    assert_eq!(
+        column(digits.into(), 0).await,
+        ["Integer(5)", "Integer(12)", "Integer(2002)"]
+    );
+    // NOT IN is not a seek, and still answers (NULL phones are neither in nor out).
+    assert_eq!(
+        column(
+            "SELECT count(*) FROM p \
+             WHERE replace(replace(phone, '-', ''), ' ', '') NOT IN ('070500')"
+                .into(),
+            0
+        )
+        .await,
+        ["Integer(1999)"]
+    );
+    // The index compares with NOCASE, the IN list without a collation: no seek, same answer.
+    let lower = "SELECT id FROM p WHERE lower(name) IN ('name7')";
+    let p = plan(lower).await;
+    assert!(!format!("{p:?}").contains("p_lower"), "{p:?}");
+    assert_eq!(column(lower.into(), 0).await, ["Integer(7)"]);
+}
+
 /// Generated SQL often has long chains of OR or AND: they are balanced, not nested once per
 /// operand, so they stay far below the expression depth limit and keep their meaning.
 #[tokio::test]
