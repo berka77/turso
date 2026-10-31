@@ -2687,6 +2687,87 @@ async fn deleting_rows_that_refer_to_each_other_checks_at_the_end_of_the_stateme
 
 // Parsing and planning recurse once per nesting level. A statement nested deeper than the
 // thread's stack allows is refused with an error; overflowing the stack would abort the process.
+/// Generated SQL often has long chains of OR or AND: they are balanced, not nested once per
+/// operand, so they stay far below the expression depth limit and keep their meaning.
+#[tokio::test]
+async fn long_or_and_and_chains_are_not_too_deep() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .await
+        .unwrap();
+    conn.execute("CREATE INDEX t_v ON t (v)", ()).await.unwrap();
+    conn.execute(
+        "INSERT INTO t (v) SELECT value FROM generate_series(1, 3000)",
+        (),
+    )
+    .await
+    .unwrap();
+    let scalar = |sql: String| {
+        let conn = conn.clone();
+        async move {
+            let mut rows = conn.query(&sql, ()).await.unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            row.get_value(0).unwrap()
+        }
+    };
+    // Every even value up to 2000: 1,000 terms.
+    let or = (1..=1000)
+        .map(|i| format!("v = {}", 2 * i))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    assert_eq!(
+        scalar(format!("SELECT count(*) FROM t WHERE {or}")).await,
+        Value::Integer(1000)
+    );
+    let and = (1..=1000)
+        .map(|i| format!("v > {i}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    assert_eq!(
+        scalar(format!("SELECT count(*) FROM t WHERE {and}")).await,
+        Value::Integer(2000)
+    );
+    // Three-valued logic is unchanged: NULL OR ... OR TRUE is true, NULL AND ... AND FALSE false.
+    assert_eq!(
+        scalar(format!(
+            "SELECT (NULL OR {}) IS 1",
+            vec!["0"; 300].join(" OR ") + " OR 1"
+        ))
+        .await,
+        Value::Integer(1)
+    );
+    assert_eq!(
+        scalar(format!(
+            "SELECT (NULL AND {}) IS 0",
+            vec!["1"; 300].join(" AND ") + " AND 0"
+        ))
+        .await,
+        Value::Integer(1)
+    );
+    // Mixed operators keep their precedence: a AND b OR c AND d.
+    assert_eq!(
+        scalar(
+            "SELECT count(*) FROM t WHERE v > 10 AND v < 13 OR v > 20 AND v < 23 OR v = 99".into()
+        )
+        .await,
+        Value::Integer(5)
+    );
+    // An OR of equalities still uses the index.
+    let mut rows = conn
+        .query(
+            "EXPLAIN QUERY PLAN SELECT id FROM t WHERE v = 1 OR v = 2 OR v = 3 OR v = 4",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut plan = String::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        plan.push_str(&format!("{:?}\n", row.get_value(3).unwrap()));
+    }
+    assert!(plan.contains("t_v"), "{plan}");
+}
+
 #[test]
 fn deeply_nested_statements_are_refused_not_overflowed() {
     let n = 5000;

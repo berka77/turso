@@ -2141,6 +2141,8 @@ impl<'a> Parser<'a> {
             // Set by arms that replace `result` with a fresh leaf (e.g. `x IN ()`)
             // instead of wrapping it, so its height resets to 1.
             let mut leaf = false;
+            // Set by an arm that builds a whole subtree with a known height.
+            let mut chain_height = None;
             if tok.token_type == TK_NOT {
                 eat_assert!(self, TK_NOT);
                 tok = peek_expect!(
@@ -2156,21 +2158,29 @@ impl<'a> Parser<'a> {
                     eat_assert!(self, TK_NULL);
                     Box::new(Expr::NotNull(result))
                 }
-                TK_OR => {
-                    eat_assert!(self, TK_OR);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::Or,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_AND => {
-                    eat_assert!(self, TK_AND);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::And,
-                        self.parse_expr(pre + 1)?,
-                    ))
+                TK_OR | TK_AND => {
+                    // A chain of one operator (`a OR b OR c ...`, generated SQL has hundreds)
+                    // becomes a balanced tree, so its height grows with the logarithm of its
+                    // length instead of the length. Both operators are associative and the
+                    // operands keep their order, so the result and the order of evaluation
+                    // are unchanged.
+                    let (kind, op) = if tok.token_type == TK_OR {
+                        (TK_OR, Operator::Or)
+                    } else {
+                        (TK_AND, Operator::And)
+                    };
+                    let mut operands = vec![(result, result_height)];
+                    loop {
+                        eat_assert!(self, TK_OR, TK_AND);
+                        let operand = self.parse_expr(pre + 1)?;
+                        operands.push((operand, self.last_expr_height));
+                        if !matches!(self.peek()?, Some(t) if t.token_type == kind) {
+                            break;
+                        }
+                    }
+                    let (tree, height) = balanced(operands, op);
+                    chain_height = Some(height);
+                    tree
                 }
                 TK_EQ => {
                     eat_assert!(self, TK_EQ);
@@ -2545,7 +2555,9 @@ impl<'a> Parser<'a> {
             // Each iteration wraps the previous `result` in a new node, growing
             // the tree by one level; `last_expr_height` holds the height of the
             // tallest sub-expression parsed in this iteration.
-            result_height = if leaf {
+            result_height = if let Some(h) = chain_height {
+                h
+            } else if leaf {
                 1
             } else {
                 1 + result_height.max(self.last_expr_height)
@@ -5445,6 +5457,18 @@ impl<'a> Parser<'a> {
             _ => Ok(Stmt::Optimize { idx_name: None }),
         }
     }
+}
+
+/// Join `operands` (each with its height) with `op` into a balanced tree, keeping their order.
+/// Returns the tree and its height.
+fn balanced(mut operands: Vec<(Box<Expr>, usize)>, op: Operator) -> (Box<Expr>, usize) {
+    if operands.len() == 1 {
+        return operands.pop().expect("one operand");
+    }
+    let right = operands.split_off(operands.len() / 2);
+    let (l, lh) = balanced(operands, op);
+    let (r, rh) = balanced(right, op);
+    (Box::new(Expr::Binary(l, op, r)), 1 + lh.max(rh))
 }
 
 #[cfg(test)]

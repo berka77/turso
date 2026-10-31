@@ -5,22 +5,24 @@
 # produces different results.
 @skip-file-if sqlite "Turso enforces MAX_EXPR_DEPTH; SQLite's own limit is 1000, so sqlite3 behaves differently"
 
-# CLI backend only: the rust backend executes queries on tokio worker threads
-# whose small stacks cannot hold an at-limit expression in a debug build. The
-# in-process boundary coverage lives in tests/integration/expr_depth_stack_overflow.rs,
-# which runs on a thread with a controlled stack size.
+# CLI backend only. An at-limit expression does not fit the stack of a debug
+# build (it is refused as too deeply nested), so the boundary coverage lives in
+# tests/integration/expr_depth_stack_overflow.rs, which runs on a thread with a
+# controlled stack size.
 @backend cli
-test expr_depth_or_chain_at_limit {
-    SELECT 1{{repeat:expr_depth_limit-1: OR 1}};
-}
-expect {
-    1
-}
-
-@backend cli
-test expr_depth_or_chain_over_limit {
-    SELECT 1{{repeat:expr_depth_limit: OR 1}};
+test expr_depth_arithmetic_chain_over_limit {
+    SELECT 1{{repeat:expr_depth_limit: + 1}};
 }
 expect error {
     Parse error: Expression tree is too large \(maximum depth {{expr_depth_limit}}\)
+}
+
+# OR and AND chains are built as balanced trees, so a chain longer than the
+# limit is only a few levels deep.
+@backend cli
+test expr_depth_long_or_chain_is_balanced {
+    SELECT 0{{repeat:expr_depth_limit: OR 0}} OR 1;
+}
+expect {
+    1
 }
