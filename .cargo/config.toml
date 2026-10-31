@@ -1,5 +1,9 @@
 [env]
 LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS" # necessary for rusqlite dependency in order to bundle SQLite with math functions included
+# Test threads get 2 MiB by default. Statements nested deeper than the stack allows are refused,
+# and debug frames are large, so fuzzed expressions some 50 levels deep need more (servers give
+# their threads 8 MiB too).
+RUST_MIN_STACK = "8388608"
 
 [build]
 # turso-sync package uses tokio_unstable to seed LocalRuntime and make it deterministic
