@@ -2685,8 +2685,6 @@ async fn deleting_rows_that_refer_to_each_other_checks_at_the_end_of_the_stateme
     assert_eq!(row.get_value(0).unwrap(), Value::Integer(2));
 }
 
-// Parsing and planning recurse once per nesting level. A statement nested deeper than the
-// thread's stack allows is refused with an error; overflowing the stack would abort the process.
 /// An expression index drives an IN list as it drives an equality (SQLite does too).
 #[tokio::test]
 async fn an_expression_index_serves_an_in_list() {
@@ -2740,6 +2738,24 @@ async fn an_expression_index_serves_an_in_list() {
     let p = plan(lower).await;
     assert!(!format!("{p:?}").contains("p_lower"), "{p:?}");
     assert_eq!(column(lower.into(), 0).await, ["Integer(7)"]);
+    // An index whose key carries the collation the expression compares with (the column's,
+    // which a function's result keeps) serves the expression written without the COLLATE.
+    for sql in [
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)",
+        "CREATE INDEX q_head ON q ((substr(name, 1, 3)) COLLATE NOCASE)",
+        "INSERT INTO q (name) SELECT 'n' || value FROM generate_series(1, 2000)",
+    ] {
+        conn.execute(sql, ()).await.unwrap();
+    }
+    for sql in [
+        "SELECT count(*) FROM q WHERE substr(name, 1, 3) = 'N12'",
+        "SELECT count(*) FROM q WHERE substr(name, 1, 3) IN ('N12', 'x')",
+    ] {
+        let p = plan(sql).await;
+        assert!(format!("{p:?}").contains("q_head"), "{p:?}");
+        // n12, n120 to n129 and n1200 to n1299, matched without regard to case.
+        assert_eq!(column(sql.into(), 0).await, ["Integer(111)"]);
+    }
 }
 
 /// Generated SQL often has long chains of OR or AND: they are balanced, not nested once per
@@ -2823,6 +2839,8 @@ async fn long_or_and_and_chains_are_not_too_deep() {
     assert!(plan.contains("t_v"), "{plan}");
 }
 
+/// Parsing and planning recurse once per nesting level. A statement nested deeper than the
+/// thread's stack allows is refused with an error; overflowing the stack would abort the process.
 #[test]
 fn deeply_nested_statements_are_refused_not_overflowed() {
     let n = 5000;

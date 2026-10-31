@@ -957,7 +957,9 @@ fn resolve_sorted_columns_with_resolver(
                 pos_in_table: EXPR_INDEX_SENTINEL,
                 collation: explicit_collation,
                 default: None,
-                expr: Some(sc.expr.clone()),
+                // Without its COLLATE, which is the key's collation, not part of the expression
+                // a query must repeat (SQLite skips it when matching, too).
+                expr: Some(Box::new(base_expr.clone())),
             })
             .expect("resolved index columns vector was preallocated to cols.len()");
     }
